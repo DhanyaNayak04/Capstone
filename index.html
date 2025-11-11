@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, user-scalable=no"
+    />
+    <title>Assistive AI (ESP32 Camera)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      html,
+      body {
+        background-color: #000;
+        color: #fff;
+        overscroll-behavior: none;
+      }
+      #listenButton {
+        transition: all 0.2s ease;
+      }
+      #listenButton.listening {
+        background-color: #ef4444 !important;
+        transform: scale(1.1);
+        box-shadow: 0 0 40px rgba(239, 68, 68, 0.7);
+      }
+    </style>
+  </head>
+  <body class="bg-black text-white font-sans overflow-hidden">
+    <!-- ESP32 Camera Stream -->
+    <img
+      id="esp32Feed"
+      class="w-full h-full object-cover fixed top-0 left-0 -z-10 opacity-30"
+      alt="ESP32 Camera Feed"
+    />
+
+    <!-- Hidden canvas for capture -->
+    <canvas id="captureCanvas" class="hidden"></canvas>
+
+    <!-- Main UI -->
+    <div class="flex flex-col h-screen justify-between items-center p-8">
+      <div id="status" class="text-2xl font-medium text-center h-20">
+        Tap the button and speak a command.
+      </div>
+      <div class="flex justify-center items-center">
+        <button
+          id="listenButton"
+          class="bg-blue-600 text-white rounded-full w-40 h-40 flex justify-center items-center shadow-lg focus:outline-none"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            id="micIcon"
+            class="w-20 h-20"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <path
+              d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72h-1.7z"
+            />
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <script>
+      // === CONFIG ===
+      const SERVER_API_URL = "http://192.168.220.1:8000/api/analyze";
+      const ESP32_STREAM_URL = "http://10.248.176.19:81/stream"; // 👈 Change to your ESP32-CAM IP
+
+      // === DOM Elements ===
+      const esp32Feed = document.getElementById("esp32Feed");
+      const canvas = document.getElementById("captureCanvas");
+      const listenButton = document.getElementById("listenButton");
+      const statusDiv = document.getElementById("status");
+      const micIcon = document.getElementById("micIcon");
+
+      let recognition;
+      let isListening = false;
+
+      // === Text-to-Speech ===
+      function speak(text) {
+        console.log("Speaking:", text);
+        statusDiv.textContent = text;
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = "en-US";
+        speechSynthesis.speak(utterance);
+      }
+
+      // === Speech Recognition ===
+      function initSpeechRecognition() {
+        const SpeechRecognition =
+          window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+          speak(
+            "Error: Speech recognition is not supported in this browser. Please use Chrome on Android."
+          );
+          return;
+        }
+
+        recognition = new SpeechRecognition();
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = "en-US";
+
+        recognition.onresult = (event) => {
+          const command = event.results[0][0].transcript.toLowerCase().trim();
+          console.log("Command heard:", command);
+          statusDiv.textContent = `Heard: "${command}"`;
+          processCommand(command);
+        };
+
+        recognition.onend = () => {
+          isListening = false;
+          listenButton.classList.remove("listening");
+          micIcon.innerHTML = (
+            <path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72h-1.7z" />
+          );
+        };
+
+        recognition.onerror = (event) => {
+          console.error("Speech recognition error:", event.error);
+          speak("Sorry, I didn't catch that. Please try again.");
+        };
+      }
+
+      // === ESP32 Camera Setup ===
+      function initESP32Camera() {
+        esp32Feed.src = `${ESP32_STREAM_URL}`;
+        esp32Feed.onload = () => {
+          // Set canvas size after first frame loads
+          canvas.width = esp32Feed.width || 640;
+          canvas.height = esp32Feed.height || 480;
+          speak("ESP32 camera connected. System ready.");
+        };
+        esp32Feed.onerror = () => {
+          speak(
+            "Error: Could not load ESP32 camera feed. Please check connection."
+          );
+        };
+      }
+
+      // === Core Logic ===
+      function toggleListen() {
+        if (isListening) {
+          recognition.stop();
+        } else {
+          try {
+            recognition.start();
+            isListening = true;
+            listenButton.classList.add("listening");
+            micIcon.innerHTML = `<path d="M12 12c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2s2 .9 2 2v4c0 1.1-.9 2-2 2zm0-8c-2.21 0-4 1.79-4 4v4c0 2.21 1.79 4 4 4s4-1.79 4-4V8c0-2.21-1.79-4-4-4z"/><path d="M19 11h-1.7c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72z"/>`;
+            speak("Listening...");
+          } catch (e) {
+            console.error("Could not start listening:", e);
+            isListening = false;
+          }
+        }
+      }
+
+      function processCommand(command) {
+        if (command.includes("who")) {
+          sendFrameToServer("who");
+        } else if (command.includes("read")) {
+          sendFrameToServer("read");
+        } else if (command.includes("what")) {
+          sendFrameToServer("what");
+        } else {
+          speak(`I heard "${command}", but I don't know that command.`);
+        }
+      }
+
+      async function sendFrameToServer(command) {
+        speak(`Processing your request to ${command}...`);
+        const context = canvas.getContext("2d");
+        context.drawImage(esp32Feed, 0, 0, canvas.width, canvas.height);
+        const imageData = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
+
+        try {
+          const response = await fetch(SERVER_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ command, image_b64: imageData }),
+          });
+          if (!response.ok)
+            throw new Error(`Server error: ${response.statusText}`);
+          const result = await response.json();
+          speak(result.text);
+        } catch (err) {
+          console.error("API Fetch error:", err);
+          speak(
+            "Sorry, I could not connect to the AI server. Please check the network."
+          );
+        }
+      }
+
+      // === Initialize Everything ===
+      window.onload = () => {
+        initSpeechRecognition();
+        initESP32Camera();
+        listenButton.addEventListener("click", toggleListen);
+        speak("Welcome to Assistive AI with ESP32 camera. Tap to speak.");
+      };
+    </script>
+  </body>
+</html>

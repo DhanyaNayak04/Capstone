@@ -1,0 +1,17 @@
+gTTS
+playsound
+playsound3
+sounddevice
+vosk
+opencv-python
+ultralytics
+torch
+numpy
+mtcnn
+keras-facenet
+requests
+pytesseract
+Pillow
+easyocr
+pygame
+mutagen
