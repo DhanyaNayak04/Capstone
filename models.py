@@ -3,7 +3,7 @@ from ultralytics import YOLO
 import torch
 
 # Load YOLO once
-yolo_model = YOLO('yolo11s.pt')
+yolo_model = YOLO('yolo12m.pt')
 
 # Load MiDaS depth model
 midas = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")

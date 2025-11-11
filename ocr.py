@@ -235,13 +235,23 @@ def _postprocess_text_and_maybe_rerun(best: str, frame: np.ndarray) -> str:
     return cleaned
 
 
-def read_text_from_frame(frame: np.ndarray, boxes: Optional[List[dict]] = None, debug_dir: Optional[str] = None) -> str:
+def read_text_from_frame(
+    frame: np.ndarray,
+    boxes: Optional[List[dict]] = None,
+    debug_dir: Optional[str] = None,
+    use_cnn: Optional[bool] = False,
+    **_: object,
+) -> str:
     """Extract readable text from a frame.
 
     Order: provided boxes -> center crop -> full frame -> EasyOCR fallback.
     When debug_dir is set, crops are saved for inspection.
     """
     _ensure_tesseract_on_windows()
+
+    # Note: `use_cnn` is accepted for backward-compatibility with older
+    # call sites. This implementation uses a robust Tesseract pipeline with
+    # EasyOCR fallback regardless of this flag, so we ignore it safely.
 
     def _save(img_np: np.ndarray, name: str) -> None:
         if not debug_dir:
