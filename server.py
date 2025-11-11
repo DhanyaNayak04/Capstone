@@ -1,6 +1,6 @@
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import base64
 import cv2
@@ -8,11 +8,21 @@ import numpy as np
 import io
 from PIL import Image
 import os
-
-# NEW: Import the CORS middleware
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
+from datetime import datetime
 
-# Import your existing Python modules
+# --- Create a folder for debug images ---
+DEBUG_DIR = "debug_frames"
+os.makedirs(DEBUG_DIR, exist_ok=True)
+print(f"Saving incoming frames to: {os.path.abspath(DEBUG_DIR)}")
+# ---------------------------------------------
+
+# --- Set your ESP32 IP Address here ---
+# This MUST be the IP of your ESP32-CAM on your WiFi network
+ESP32_CAM_URL =  "http://10.248.176.19:81/stream"
+# -----------------------------------------------
+
 try:
     from models import yolo_model
     from facenet_recognition import recognize_face_and_get_text
@@ -25,19 +35,17 @@ except ImportError as e:
 
 app = FastAPI()
 
-# --- NEW: Add CORS Middleware ---
-# This block tells the server to allow web browsers
-# from any origin to make requests.
-origins = ["*"]  # Allows all origins
-
+# --- Add CORS Middleware ---
+# This allows the browser to make requests from different origins
+origins = ["*"] 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (GET, POST, OPTIONS, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"], 
+    allow_headers=["*"], 
 )
-# --- End of new block ---
+# --- End of CORS block ---
 
 
 # --- Helper Function ---
@@ -71,7 +79,51 @@ async def get_index():
     print("Serving index.html")
     return FileResponse("index.html")
 
-# --- API Endpoint ---
+# --- Proxy Endpoint for Camera Stream ---
+client = httpx.AsyncClient(timeout=None)
+
+@app.get("/camera_stream")
+async def get_camera_stream():
+    """
+    Proxies the ESP32-CAM's MJPEG stream.
+    The mobile app will connect to this endpoint.
+    """
+    print(f"Client connected to camera stream. Proxying from: {ESP32_CAM_URL}")
+    try:
+        # Build request to ESP32-CAM. stream=True below keeps connection open for MJPEG.
+        req = client.build_request("GET", ESP32_CAM_URL)
+        # Send the request and get a streaming response
+        r = await client.send(req, stream=True)
+        
+        # --- THIS IS THE "Tainted Canvas" FIX ---
+        # We must add this header to the response we send to the browser
+        # It tells the browser "I give you permission to use this data."
+        proxy_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+        # Preserve content-type (e.g., multipart/x-mixed-replace; boundary=...) from source stream
+        ct = r.headers.get("content-type")
+        if ct:
+            proxy_headers["Content-Type"] = ct
+        # --- END OF FIX ---
+
+        # Stream the content back to the mobile app
+        return StreamingResponse(r.aiter_bytes(), headers=proxy_headers, media_type=r.headers.get("content-type"))
+        
+    except httpx.ConnectError as e:
+        # This error happens if the ESP32_CAM_URL is wrong
+        print(f"!!! CRITICAL ERROR: Could not connect to ESP32-CAM at {ESP32_CAM_URL}")
+        print("Please check the IP address and that the ESP32-CAM is on the same network.")
+        print(f"Error details: {e}")
+        return {"error": "Could not connect to ESP32-CAM"}, 500
+    except Exception as e:
+        print(f"Error proxying stream: {e}")
+        return {"error": str(e)}, 500
+
+# --- API Endpoint for AI Analysis ---
 @app.post("/api/analyze", response_model=ApiResponse)
 async def analyze_frame(request: ApiRequest):
     """
@@ -84,23 +136,33 @@ async def analyze_frame(request: ApiRequest):
     if frame is None:
         return ApiResponse(text="Sorry, I could not read the image.")
 
+    # --- Save the frame for debugging ---
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"{DEBUG_DIR}/{timestamp}_{request.command}.jpg"
+        cv2.imwrite(filename, frame)
+        print(f"Saved incoming frame to: {filename}")
+    except Exception as e:
+        print(f"Error saving frame: {e}")
+    # ------------------------------------
+
     response_text = "I'm not sure what you asked."
     try:
+        # --- COMMAND ROUTER ---
         if "who" in request.command:
             response_text = recognize_face_and_get_text(frame)
             print(f"[SERVER] Face recognition result: {response_text}")
 
         elif "read" in request.command:
-            # --- THIS IS THE FIX ---
-            response_text = read_text_from_frame(
-                frame, 
-                boxes=[], 
-                use_cnn=False, 
-                debug_dir="debug_images"  # <-- ADD THIS LINE
-            )
-            # --- END OF FIX ---
+            # Use Tesseract (use_cnn=False) for general text
+            text = read_text_from_frame(frame, boxes=[], use_cnn=False)
+            if not text:
+                response_text = "I couldn't detect any readable text."
+            else:
+                response_text = text.strip()
 
         elif "what" in request.command:
+            # Use the powerful YOLO model for scene description
             results = yolo_model(frame)
             names = yolo_model.names
             detected_objects = set()
@@ -117,6 +179,7 @@ async def analyze_frame(request: ApiRequest):
         
         else:
             response_text = "Sorry, I didn't recognize that command."
+
     except Exception as e:
         print(f"[SERVER] Error during processing: {e}")
         response_text = "I encountered an error trying to analyze that."
@@ -124,8 +187,11 @@ async def analyze_frame(request: ApiRequest):
     print(f"[SERVER] Sending response: {response_text}")
     return ApiResponse(text=response_text)
 
+
 if __name__ == "__main__":
     print("--- Starting AI Server (and Web App) with CORS ---")
     print(f"Looking for index.html in: {os.getcwd()}")
-    print("Open your browser to http://127.0.0.1:8000")
+    print(f"Saving debug frames in: {os.path.abspath(DEBUG_DIR)}")
+    print("Make sure to set 'ESP32_CAM_URL' in this file.")
+    print("Run on your phone: http://[YOUR_LAPTOP_IP]:8000")
     uvicorn.run(app, host="0.0.0.0",port=8000)
