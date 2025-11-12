@@ -10,11 +10,16 @@
     <style>
       /* ... existing style ... */
       #listenButton:disabled {
-        background-color: #4b5563; /* Gray */
+        background-color: #4b5563;
         opacity: 0.5;
         cursor: not-allowed;
       }
-      /* ... existing style ... */
+      /* Prefer nearest-neighbor when scaling to reduce blur */
+      #esp32Feed,
+      #captureCanvas {
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+      }
     </style>
   </head>
   <body
@@ -37,7 +42,7 @@
         left: 0;
         width: 100%;
         height: 100%;
-        object-fit: cover;
+        object-fit: contain; /* was 'cover' (causes resampling blur) */
         z-index: -1;
         opacity: 0.3;
       "
@@ -172,6 +177,8 @@
           setTimeout(() => {
             canvas.width = esp32Feed.naturalWidth || 640;
             canvas.height = esp32Feed.naturalHeight || 480;
+            // Keep aspect ratio consistent for display
+            esp32Feed.style.aspectRatio = `${canvas.width} / ${canvas.height}`;
             console.log(
               "Camera stream loaded. Canvas size set:",
               canvas.width,
@@ -231,12 +238,17 @@
         speak(`Processing your request to ${command}...`);
         console.log("LOG: Sending frame to server...");
 
-        const context = canvas.getContext("2d");
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        context.imageSmoothingEnabled = false;
+
         let imageData;
         try {
-          // This should now work because of the crossorigin attribute
+          context.clearRect(0, 0, canvas.width, canvas.height);
           context.drawImage(esp32Feed, 0, 0, canvas.width, canvas.height);
-          imageData = canvas.toDataURL("image/jpeg", 0.8).split(",")[1];
+          // Prefer lossless PNG to preserve detail
+          imageData = canvas.toDataURL("image/png").split(",")[1];
+          // Or, if bandwidth matters:
+          // imageData = canvas.toDataURL("image/jpeg", 0.98).split(",")[1];
         } catch (e) {
           console.error("Canvas drawImage error:", e); // This is where it failed last time
           speak(

@@ -2,12 +2,21 @@
 
 Keep this module self-contained so it can be edited safely.
 """
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import os
 import re
 import cv2
 import numpy as np
 from PIL import Image
+import base64
+import requests
+
+try:
+    # Local config for API keys and model selection
+    from config import GEMINI_API_KEY, GEMINI_MODEL, OCR_GEMINI_DIRECT
+except Exception:
+    GEMINI_API_KEY = ""
+    GEMINI_MODEL = "gemini-2.0-flash"
 
 __all__ = ["read_text_from_frame"]
 
@@ -32,6 +41,75 @@ def _ensure_tesseract_on_windows() -> None:
 
 def _to_pil(img: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+
+def _np_to_jpeg_base64(img_bgr: np.ndarray, max_side: int = 1280) -> Tuple[str, str]:
+    """Convert BGR np image to reasonably sized JPEG and base64-encode it.
+
+    Returns (base64_string, mime_type). Scales down the image to reduce latency/cost.
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        raise ValueError("Empty image")
+    h, w = img_bgr.shape[:2]
+    scale = 1.0
+    m = max(h, w)
+    if m > max_side:
+        scale = max_side / float(m)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    # Encode as medium-quality JPEG
+    ok, buf = cv2.imencode('.jpg', img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        raise RuntimeError("JPEG encoding failed")
+    b64 = base64.b64encode(buf.tobytes()).decode('ascii')
+    return b64, 'image/jpeg'
+
+
+def _call_gemini_transcribe(img_bgr: np.ndarray, timeout: float = 20.0) -> str:
+    """Call Gemini Vision API to transcribe visible text only.
+
+    Uses the same prompt constraint as the image-extractor: return only text seen,
+    no commentary, no completions of partial words.
+    """
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured. Set it via environment variable.")
+
+    b64, mime = _np_to_jpeg_base64(img_bgr)
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+    prompt = (
+        "Transcribe all text visible in this image. Do not add any extra information, "
+        "comments, or formatting. Do not try to complete any partial sentences. Just "
+        "return the exact text you see."
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": mime, "data": b64}},
+                ]
+            }
+        ]
+    }
+
+    headers = {"Content-Type": "application/json"}
+    r = requests.post(api_url, json=payload, headers=headers, timeout=timeout)
+    if not r.ok:
+        raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:512]}")
+
+    data = r.json()
+    # Expected path: candidates[0].content.parts[0].text
+    try:
+        candidates = data.get("candidates") or []
+        if candidates:
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if parts and isinstance(parts[0], dict) and "text" in parts[0]:
+                return (parts[0]["text"] or "").strip()
+    except Exception:
+        pass
+    raise RuntimeError("Could not parse text from Gemini response")
 
 
 def _preprocess_crop(img: np.ndarray) -> np.ndarray:
@@ -244,7 +322,11 @@ def read_text_from_frame(
 ) -> str:
     """Extract readable text from a frame.
 
-    Order: provided boxes -> center crop -> full frame -> EasyOCR fallback.
+    Preferred order with Gemini available:
+    - Try Gemini once on the best crop (a provided box if any, else center crop, else full frame)
+    - If Gemini fails or is not configured, fall back to legacy Tesseract/EasyOCR pipeline
+
+    Legacy order (fallback): provided boxes -> center crop -> full frame -> EasyOCR fallback.
     When debug_dir is set, crops are saved for inspection.
     """
     _ensure_tesseract_on_windows()
@@ -264,6 +346,67 @@ def read_text_from_frame(
 
     candidates: List[str] = []
 
+    # Determine a single "best" crop for Gemini to control cost/latency.
+    def _gemini_target() -> np.ndarray:
+        """Choose the frame region for Gemini OCR.
+
+        Strategy change: Use FULL FRAME first for richer context. If boxes exist and one
+        box covers >35% of area, use that (assuming it's a document). Otherwise full frame.
+        """
+        h, w = frame.shape[:2]
+        area_total = h * w
+        if boxes:
+            try:
+                # find largest box area ratio
+                best = None
+                best_ratio = 0.0
+                for b in boxes:
+                    xy = b.get('xyxy') if isinstance(b, dict) else b
+                    x1, y1, x2, y2 = map(int, xy)
+                    box_area = max(0, (x2 - x1)) * max(0, (y2 - y1))
+                    ratio = box_area / float(area_total + 1)
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best = (x1, y1, x2, y2)
+                if best and best_ratio > 0.35:
+                    x1, y1, x2, y2 = best
+                    pad = 12
+                    x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+                    x2 = min(w, x2 + pad); y2 = min(h, y2 + pad)
+                    crop = frame[y1:y2, x1:x2]
+                    _save(crop, 'gemini_doc_box')
+                    return crop
+            except Exception:
+                pass
+        _save(frame, 'gemini_full')
+        return frame
+
+    # Try Gemini first when configured
+    if GEMINI_API_KEY:
+        try:
+            target = _gemini_target()
+            txt = _call_gemini_transcribe(target)
+            if txt:
+                txt = re.sub(r"\r", "\n", txt)
+                # Preserve original line structure for Gemini (don't dehyphenate yet)
+                cleaned = re.sub(r"\n{2,}", "\n", txt).strip()
+                try:
+                    print(f"[OCR] Gemini used. Length={len(cleaned)}")
+                except Exception:
+                    pass
+                if OCR_GEMINI_DIRECT:
+                    return cleaned
+                # Legacy overlay handling (if direct disabled)
+                cleaned2 = _dehyphenate_lines(re.sub(r"\s+", " ", cleaned).strip())
+                return _postprocess_text_and_maybe_rerun(cleaned2, frame)
+        except Exception:
+            try:
+                print("[OCR] Gemini failed, using legacy OCR fallback.")
+            except Exception:
+                pass
+            pass  # fallback to legacy path
+
+    # Legacy OCR path below
     # 1) try provided boxes
     if boxes:
         for i, b in enumerate(boxes):

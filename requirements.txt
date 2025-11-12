@@ -15,3 +15,4 @@ Pillow
 easyocr
 pygame
 mutagen
+python-dotenv

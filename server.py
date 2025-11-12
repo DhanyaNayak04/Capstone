@@ -154,7 +154,7 @@ async def analyze_frame(request: ApiRequest):
             print(f"[SERVER] Face recognition result: {response_text}")
 
         elif "read" in request.command:
-            # Use Tesseract (use_cnn=False) for general text
+            # Prefer Gemini OCR if configured (fall back to Tesseract/EasyOCR)
             text = read_text_from_frame(frame, boxes=[], use_cnn=False)
             if not text:
                 response_text = "I couldn't detect any readable text."
