@@ -6,7 +6,7 @@ vosk
 opencv-python
 ultralytics
 torch
-numpy
+numpy<2
 mtcnn
 keras-facenet
 requests
@@ -16,3 +16,7 @@ easyocr
 pygame
 mutagen
 python-dotenv
+fastapi
+uvicorn
+httpx
+pydantic

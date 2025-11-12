@@ -1,5 +1,6 @@
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import base64
@@ -11,6 +12,7 @@ import os
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from datetime import datetime
+import json as _json
 
 # --- Create a folder for debug images ---
 DEBUG_DIR = "debug_frames"
@@ -85,42 +87,50 @@ client = httpx.AsyncClient(timeout=None)
 @app.get("/camera_stream")
 async def get_camera_stream():
     """
-    Proxies the ESP32-CAM's MJPEG stream.
-    The mobile app will connect to this endpoint.
+    Proxies the ESP32-CAM's MJPEG stream to the browser with CORS headers.
+    Guard against source stream errors so the app doesn't crash.
     """
     print(f"Client connected to camera stream. Proxying from: {ESP32_CAM_URL}")
     try:
-        # Build request to ESP32-CAM. stream=True below keeps connection open for MJPEG.
         req = client.build_request("GET", ESP32_CAM_URL)
-        # Send the request and get a streaming response
         r = await client.send(req, stream=True)
-        
-        # --- THIS IS THE "Tainted Canvas" FIX ---
-        # We must add this header to the response we send to the browser
-        # It tells the browser "I give you permission to use this data."
+
         proxy_headers = {
             "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0",
         }
-        # Preserve content-type (e.g., multipart/x-mixed-replace; boundary=...) from source stream
         ct = r.headers.get("content-type")
         if ct:
             proxy_headers["Content-Type"] = ct
-        # --- END OF FIX ---
 
-        # Stream the content back to the mobile app
-        return StreamingResponse(r.aiter_bytes(), headers=proxy_headers, media_type=r.headers.get("content-type"))
-        
+        async def iter_bytes():
+            try:
+                async for chunk in r.aiter_bytes():
+                    # yield only non-empty chunks
+                    if chunk:
+                        yield chunk
+            except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+                # Source stream hiccup; log and end gracefully
+                print(f"[STREAM] Source stream error: {e}")
+            except Exception as e:
+                print(f"[STREAM] Unexpected stream error: {e}")
+            finally:
+                try:
+                    await r.aclose()
+                except Exception:
+                    pass
+
+        return StreamingResponse(iter_bytes(), headers=proxy_headers, media_type=ct)
+
     except httpx.ConnectError as e:
-        # This error happens if the ESP32_CAM_URL is wrong
         print(f"!!! CRITICAL ERROR: Could not connect to ESP32-CAM at {ESP32_CAM_URL}")
         print("Please check the IP address and that the ESP32-CAM is on the same network.")
         print(f"Error details: {e}")
         return {"error": "Could not connect to ESP32-CAM"}, 500
     except Exception as e:
-        print(f"Error proxying stream: {e}")
+        print(f"Error proxying stream setup: {e}")
         return {"error": str(e)}, 500
 
 # --- API Endpoint for AI Analysis ---
@@ -186,6 +196,80 @@ async def analyze_frame(request: ApiRequest):
 
     print(f"[SERVER] Sending response: {response_text}")
     return ApiResponse(text=response_text)
+
+
+# ================== Voice WS (Vosk) ==================
+# Reuse existing Vosk matching and grammar from voice_thread
+try:
+    from vosk import Model as _VoskModel, KaldiRecognizer as _KaldiRecognizer
+    from voice_thread import _match_command as _vosk_match_command, VOCAB_GRAMMAR as _VOCAB_GRAMMAR
+    _VOSK_AVAILABLE = True
+except Exception as e:
+    print(f"[VOICE-WS] Vosk not available: {e}")
+    _VOSK_AVAILABLE = False
+
+_vosk_model = None  # lazy init
+
+
+@app.websocket("/ws/voice")
+async def ws_voice(websocket: WebSocket):
+    """WebSocket for streaming 16kHz mono PCM int16 audio to Vosk.
+    Sends back matched commands as JSON: {type:"control", command:"pause|resume reading|stop reading|read|who|what"}
+    """
+    await websocket.accept()
+    if not _VOSK_AVAILABLE:
+        await websocket.send_json({"type": "error", "message": "Vosk not available on server"})
+        await websocket.close()
+        return
+
+    global _vosk_model
+    if _vosk_model is None:
+        try:
+            _vosk_model = _VoskModel(lang="en-us")
+            print("[VOICE-WS] Vosk model initialized (en-us)")
+        except Exception as e:
+            await websocket.send_json({"type": "error", "message": f"Failed to load Vosk model: {e}"})
+            await websocket.close()
+            return
+
+    # Grammar-constrained recognizer for faster, robust command matching
+    rec = _KaldiRecognizer(_vosk_model, 16000, _json.dumps(list(_VOCAB_GRAMMAR)))
+
+    try:
+        while True:
+            # Receive raw PCM int16 chunk
+            data = await websocket.receive_bytes()
+            if not data:
+                continue
+            if rec.AcceptWaveform(data):
+                try:
+                    result = _json.loads(rec.Result())
+                except Exception:
+                    result = {"text": ""}
+                text = (result.get("text") or "").strip()
+                if text:
+                    print(f"[VOICE-WS] Final: {text}")
+                    try:
+                        cmd = _vosk_match_command(text)
+                    except Exception:
+                        cmd = None
+                    if cmd:
+                        await websocket.send_json({"type": "control", "command": cmd})
+            else:
+                # Optionally could send partials for UI; keeping quiet to reduce traffic
+                pass
+    except WebSocketDisconnect:
+        print("[VOICE-WS] Client disconnected")
+    except Exception as e:
+        print(f"[VOICE-WS] Error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

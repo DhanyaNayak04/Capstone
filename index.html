@@ -112,6 +112,17 @@
       const SERVER_API_URL = `${SERVER_BASE_URL}/api/analyze`;
       // Route video through our proxy to avoid CORS/tainted canvas
       const PROXIED_STREAM_URL = `${SERVER_BASE_URL}/camera_stream`;
+      // WebSocket URL for Vosk voice streaming
+      const VOICE_WS_URL = (() => {
+        try {
+          const u = new URL(SERVER_BASE_URL);
+          u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+          u.pathname = u.pathname.replace(/\/$/, "") + "/ws/voice";
+          return u.toString();
+        } catch (e) {
+          return SERVER_BASE_URL.replace(/^http/, "ws") + "/ws/voice";
+        }
+      })();
 
       // ... (rest of the script is unchanged) ...
       const esp32Feed = document.getElementById("esp32Feed");
@@ -120,16 +131,189 @@
       const statusDiv = document.getElementById("status");
       const micIcon = document.getElementById("micIcon");
 
-      let recognition;
+      let recognition; // kept for fallback, not used when Vosk WS is active
       let isListening = false;
       let isSystemReady = false;
+      let alwaysListeningEnabled = false; // hands-free auto-restart for WS
+
+      // Client-side reading state (Web Speech Synthesis)
+      let currentUtterance = null;
+      let isReading = false;
+      let isReadingPaused = false;
+      let readChunks = [];
+      let readIndex = 0;
+      let chunkStartOffset = 0; // resume within chunk from this char offset
+      let lastBoundaryChar = 0; // absolute char index within original chunk
+
+      // Audio/WS for server-side Vosk
+      let audioCtx = null;
+      let mediaStream = null;
+      let mediaSource = null;
+      let processor = null;
+      let voiceWs = null;
 
       function speak(text) {
         console.log("Speaking:", text);
+        // If we're reading something, cancel it before speaking short prompts
+        if (isReading && speechSynthesis) {
+          try {
+            speechSynthesis.cancel();
+          } catch (e) {}
+          isReading = false;
+          isReadingPaused = false;
+          currentUtterance = null;
+        }
         statusDiv.textContent = text;
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.lang = "en-US";
         speechSynthesis.speak(utterance);
+      }
+
+      // --- Reading controls (client-side, chunked) ---
+      function splitTextToChunks(text, maxLen = 180) {
+        // Split by sentence boundaries first
+        const sentences = text
+          .replace(/\s+/g, " ")
+          .trim()
+          .split(/(?<=[.!?])\s+/);
+        const chunks = [];
+        for (const s of sentences) {
+          if (s.length <= maxLen) {
+            if (s) chunks.push(s);
+          } else {
+            // further split long sentences by length
+            let start = 0;
+            while (start < s.length) {
+              chunks.push(s.slice(start, Math.min(start + maxLen, s.length)));
+              start += maxLen;
+            }
+          }
+        }
+        return chunks;
+      }
+
+      function speakCurrentChunk() {
+        if (!isReading || isReadingPaused) return;
+        if (readIndex >= readChunks.length) {
+          // finished
+          isReading = false;
+          isReadingPaused = false;
+          currentUtterance = null;
+          readChunks = [];
+          readIndex = 0;
+          statusDiv.textContent = "Finished reading.";
+          return;
+        }
+        const full = readChunks[readIndex];
+        const text = full.slice(chunkStartOffset);
+        if (!text || !text.trim()) {
+          readIndex++;
+          chunkStartOffset = 0;
+          lastBoundaryChar = 0;
+          speakCurrentChunk();
+          return;
+        }
+        try {
+          speechSynthesis.cancel();
+        } catch (e) {}
+        currentUtterance = new SpeechSynthesisUtterance(text);
+        currentUtterance.lang = "en-US";
+        currentUtterance.onstart = () => {
+          statusDiv.textContent = `Reading (${readIndex + 1}/${
+            readChunks.length
+          })...`;
+        };
+        // Track word boundaries so we can resume inside the chunk with minimal rewind
+        currentUtterance.onboundary = (e) => {
+          if (typeof e.charIndex === "number") {
+            lastBoundaryChar = chunkStartOffset + e.charIndex;
+          }
+        };
+        currentUtterance.onend = () => {
+          // advance only if not paused/stopped
+          if (!isReadingPaused && isReading) {
+            readIndex++;
+            chunkStartOffset = 0;
+            lastBoundaryChar = 0;
+            // schedule next chunk
+            setTimeout(() => speakCurrentChunk(), 20);
+          }
+        };
+        currentUtterance.onerror = (e) => {
+          console.error("Reading error:", e.error || e);
+        };
+        speechSynthesis.speak(currentUtterance);
+      }
+
+      function startClientReading(text) {
+        if (!text || !text.trim()) {
+          speak("No readable text detected.");
+          return;
+        }
+        try {
+          speechSynthesis.cancel();
+        } catch (e) {}
+        isReading = true;
+        isReadingPaused = false;
+        readChunks = splitTextToChunks(text);
+        readIndex = 0;
+        chunkStartOffset = 0;
+        lastBoundaryChar = 0;
+        if (readChunks.length === 0) {
+          speak("No readable text detected.");
+          isReading = false;
+          return;
+        }
+        statusDiv.textContent = "Reading text...";
+        speakCurrentChunk();
+      }
+
+      function pauseClientReading() {
+        if (isReading && !isReadingPaused) {
+          isReadingPaused = true;
+          try {
+            speechSynthesis.cancel();
+          } catch (e) {}
+          // Compute resume point inside the current chunk with a tiny rewind
+          // Use lastBoundaryChar if available; else leave chunkStartOffset unchanged
+          if (lastBoundaryChar > 0) {
+            const REWIND_CHARS = 12; // small rewind for context
+            chunkStartOffset = Math.max(0, lastBoundaryChar - REWIND_CHARS);
+          }
+          statusDiv.textContent = "Paused reading.";
+        } else {
+          // keep quiet to avoid echo
+          statusDiv.textContent = "No active reading to pause.";
+        }
+      }
+
+      function resumeClientReading() {
+        if (isReading && isReadingPaused) {
+          isReadingPaused = false;
+          statusDiv.textContent = "Resumed reading.";
+          // continue from current chunkStartOffset
+          speakCurrentChunk();
+        } else {
+          statusDiv.textContent = "Reading is not paused.";
+        }
+      }
+
+      function stopClientReading() {
+        if (isReading || isReadingPaused) {
+          try {
+            speechSynthesis.cancel();
+          } catch (e) {}
+          isReading = false;
+          isReadingPaused = false;
+          currentUtterance = null;
+          readChunks = [];
+          readIndex = 0;
+          chunkStartOffset = 0;
+          lastBoundaryChar = 0;
+          statusDiv.textContent = "Stopped reading.";
+        } else {
+          statusDiv.textContent = "No active reading.";
+        }
       }
 
       function initSpeechRecognition() {
@@ -145,24 +329,182 @@
         recognition.continuous = false;
         recognition.interimResults = false;
         recognition.lang = "en-US";
+      }
 
-        recognition.onresult = (event) => {
-          const command = event.results[0][0].transcript.toLowerCase().trim();
-          console.log("Command heard:", command);
-          statusDiv.textContent = ` Heard: "${command}"`;
-          processCommand(command);
+      // ====== Vosk WS mic streaming ======
+      function downsampleBuffer(buffer, inputSampleRate, outSampleRate) {
+        if (outSampleRate === inputSampleRate) return buffer;
+        const ratio = inputSampleRate / outSampleRate;
+        const newLen = Math.round(buffer.length / ratio);
+        const result = new Float32Array(newLen);
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+        while (offsetResult < result.length) {
+          const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
+          let accum = 0,
+            count = 0;
+          for (
+            let i = offsetBuffer;
+            i < nextOffsetBuffer && i < buffer.length;
+            i++
+          ) {
+            accum += buffer[i];
+            count++;
+          }
+          result[offsetResult] = accum / (count || 1);
+          offsetResult++;
+          offsetBuffer = nextOffsetBuffer;
+        }
+        return result;
+      }
+
+      function floatTo16BitPCM(input) {
+        const buffer = new ArrayBuffer(input.length * 2);
+        const view = new DataView(buffer);
+        let offset = 0;
+        for (let i = 0; i < input.length; i++, offset += 2) {
+          let s = Math.max(-1, Math.min(1, input[i]));
+          view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        }
+        return buffer;
+      }
+
+      // Normalize and debounce control commands received from server
+      let lastCmdTs = 0;
+      const CMD_DEBOUNCE_MS = 600;
+      function handleServerCommand(rawCmd) {
+        const cmd = String(rawCmd || "")
+          .toLowerCase()
+          .trim();
+        const now = Date.now();
+        if (now - lastCmdTs < CMD_DEBOUNCE_MS) return;
+        lastCmdTs = now;
+        console.log("[VOICE] control:", cmd);
+
+        const isPause =
+          /(^|\b)(pause|pause reading|pause the reading)($|\b)/.test(cmd);
+        const isResume =
+          /(^|\b)(resume|continue|resume reading|continue reading)($|\b)/.test(
+            cmd
+          );
+        const isStop =
+          /(^|\b)(stop reading|cancel reading|end reading|stop)($|\b)/.test(
+            cmd
+          );
+        const isRead =
+          /(^|\b)(read this|read text|read the text|read)($|\b)/.test(cmd);
+        const isWho = /(^|\b)(who|who is|who's)($|\b)/.test(cmd);
+        const isWhat = /(^|\b)(what|what is|what's)($|\b)/.test(cmd);
+
+        if (isPause) return void pauseClientReading();
+        if (isResume) return void resumeClientReading();
+        if (isStop) return void stopClientReading();
+        if (isRead) return void sendFrameToServer("read");
+        if (isWho) return void sendFrameToServer("who");
+        if (isWhat) return void sendFrameToServer("what");
+      }
+
+      async function startVoskListening() {
+        if (voiceWs && voiceWs.readyState === WebSocket.OPEN) return;
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              echoCancellation: false,
+              noiseSuppression: false,
+              autoGainControl: false,
+            },
+          });
+        } catch (e) {
+          speak("Microphone permission denied.");
+          return;
+        }
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        mediaSource = audioCtx.createMediaStreamSource(mediaStream);
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (e) => {
+          const input = e.inputBuffer.getChannelData(0);
+          const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
+          const pcm = floatTo16BitPCM(down);
+          if (voiceWs && voiceWs.readyState === WebSocket.OPEN) {
+            voiceWs.send(pcm);
+          }
         };
+        mediaSource.connect(processor);
+        // Some browsers require connecting to destination for processor to run
+        try {
+          processor.connect(audioCtx.destination);
+        } catch (e) {}
 
-        recognition.onend = () => {
+        voiceWs = new WebSocket(VOICE_WS_URL);
+        voiceWs.binaryType = "arraybuffer";
+        voiceWs.onopen = () => {
+          isListening = true;
+          listenButton.classList.add("listening");
+          statusDiv.textContent = "Hands-free listening (Vosk server) enabled.";
+        };
+        voiceWs.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "control") {
+              handleServerCommand(msg.command);
+            } else if (msg.type === "error") {
+              statusDiv.textContent = `Voice error: ${msg.message}`;
+            }
+          } catch (e) {
+            // ignore non-JSON messages
+          }
+        };
+        voiceWs.onclose = () => {
           isListening = false;
           listenButton.classList.remove("listening");
-          micIcon.innerHTML = `<path d="M12 14c1.66 0 2.99-1.34 2.99-3L15 5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72h-1.7z"/>`;
+          if (alwaysListeningEnabled) {
+            setTimeout(() => {
+              if (alwaysListeningEnabled) startVoskListening();
+            }, 700);
+          }
         };
+        voiceWs.onerror = () => {
+          statusDiv.textContent = "Voice WebSocket error.";
+        };
+      }
 
-        recognition.onerror = (event) => {
-          console.error("Speech recognition error:", event.error);
-          speak("Sorry, I didn't catch that. Please try again.");
-        };
+      function stopVoskListening() {
+        alwaysListeningEnabled = false;
+        if (voiceWs) {
+          try {
+            voiceWs.close();
+          } catch (e) {}
+          voiceWs = null;
+        }
+        if (processor) {
+          try {
+            processor.disconnect();
+          } catch (e) {}
+          processor = null;
+        }
+        if (mediaSource) {
+          try {
+            mediaSource.disconnect();
+          } catch (e) {}
+          mediaSource = null;
+        }
+        if (audioCtx) {
+          try {
+            audioCtx.close();
+          } catch (e) {}
+          audioCtx = null;
+        }
+        if (mediaStream) {
+          try {
+            mediaStream.getTracks().forEach((t) => t.stop());
+          } catch (e) {}
+          mediaStream = null;
+        }
+        isListening = false;
+        listenButton.classList.remove("listening");
+        statusDiv.textContent = "Stopped listening.";
       }
 
       function initESP32Camera() {
@@ -207,27 +549,35 @@
         }
 
         if (isListening) {
-          recognition.stop();
+          stopVoskListening();
         } else {
-          try {
-            recognition.start();
-            isListening = true;
-            listenButton.classList.add("listening");
-            micIcon.innerHTML = ` <path d="M12 12c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2s2 .9 2 2v4c0 1.1-.9 2-2 2zm0-8c-2.21 0-4 1.79-4 4v4c0 2.21 1.79 4 4 4s4-1.79 4-4V8c0-2.21-1.79-4-4-4z"/><path d="M19 11h-1.7c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72z"/>`;
-            speak("Listening...");
-          } catch (e) {
-            console.error("Could not start listening:", e);
-            isListening = false;
-          }
+          alwaysListeningEnabled = true; // enable auto-reconnect for WS
+          startVoskListening();
         }
       }
 
       function processCommand(command) {
-        if (command.includes("who")) {
+        const norm = command.toLowerCase();
+        // Reading control intents first
+        if (/(^|\b)(pause|pause reading)($|\b)/.test(norm)) {
+          pauseClientReading();
+        } else if (
+          /(^|\b)(resume|continue|resume reading|continue reading)($|\b)/.test(
+            norm
+          )
+        ) {
+          resumeClientReading();
+        } else if (
+          /(^|\b)(stop reading|cancel reading|end reading|stop)($|\b)/.test(
+            norm
+          )
+        ) {
+          stopClientReading();
+        } else if (norm.includes("who")) {
           sendFrameToServer("who");
-        } else if (command.includes("read")) {
+        } else if (norm.includes("read")) {
           sendFrameToServer("read");
-        } else if (command.includes("what")) {
+        } else if (norm.includes("what")) {
           sendFrameToServer("what");
         } else {
           speak(`I heard "${command}", but I don't know that command.`);
@@ -235,7 +585,12 @@
       }
 
       async function sendFrameToServer(command) {
-        speak(`Processing your request to ${command}...`);
+        // For read command, avoid speaking the prompt to reduce overlap
+        if (command !== "read") {
+          speak(`Processing your request to ${command}...`);
+        } else {
+          statusDiv.textContent = `Processing your request to ${command}...`;
+        }
         console.log("LOG: Sending frame to server...");
 
         const context = canvas.getContext("2d", { willReadFrequently: true });
@@ -270,7 +625,15 @@
             throw new Error(`Server error: ${response.statusText}`);
 
           const result = await response.json();
-          speak(result.text);
+          if (command === "read") {
+            if (!result.text || !result.text.trim()) {
+              speak("I couldn't detect any readable text.");
+            } else {
+              startClientReading(result.text);
+            }
+          } else {
+            speak(result.text);
+          }
         } catch (err) {
           console.error("LOG: Error fetching from server:", err);
           speak(
